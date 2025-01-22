@@ -1,6 +1,7 @@
 use std::{
-    io::{Error, ErrorKind, Read, Result},
-    net::Ipv4Addr,
+    io::{Error, ErrorKind, Result},
+    net::{Ipv4Addr, UdpSocket},
+    usize,
 };
 
 pub struct BytePacketBuffer {
@@ -112,6 +113,55 @@ impl BytePacketBuffer {
     }
 }
 
+impl BytePacketBuffer {
+    fn write(&mut self, val: u8) -> Result<()> {
+        if self.pos >= 512 {
+            return Err(Error::new(ErrorKind::Other, "End of buffer"));
+        }
+        self.buf[self.pos] = val;
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn write_u8(&mut self, val: u8) -> Result<()> {
+        self.write(val)?;
+        Ok(())
+    }
+    fn write_u16(&mut self, val: u16) -> Result<()> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xff) as u8)?;
+        Ok(())
+    }
+    fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write(((val >> 24) & 0xff) as u8)?;
+        self.write(((val >> 16) & 0xff) as u8)?;
+        self.write(((val >> 8) & 0xff) as u8)?;
+        self.write(((val >> 0) & 0xff) as u8)?;
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<()> {
+        for name in qname.split(".") {
+            let len = name.len();
+
+            if len > 0x3f {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Single label exceeds 63 characters of length",
+                ));
+            }
+
+            self.write(len as u8)?;
+
+            for byte in name.bytes() {
+                self.write(byte)?;
+            }
+        }
+        self.write(0)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultCode {
     NOERROR = 0,
@@ -149,7 +199,7 @@ pub struct DnsHeader {
     pub truncated_message: bool,  // 1 bit
     pub recursion_desired: bool,  // 1 bit
     pub recursion_ava: bool,      // 1 bit
-    pub reserved: u8,             // 4 bits
+    pub reserved: bool,           // 4 bits
     pub response_code: ResultCode,
     pub checking_disabled: bool, // one bit
     pub auth_data: bool,         // one bit
@@ -177,15 +227,45 @@ impl DnsHeader {
         self.query_response = (a & (1 << 7)) > 0;
 
         self.response_code = ResultCode::from((b & 0xf) as u8);
-        self.reserved = ((b >> 4) & 0x07) as u8;
-        self.auth_data = (self.reserved & (1 << 1)) > 0;
-        self.checking_disabled = (self.reserved & 1) > 0;
-        self.recursion_ava = (b >> 7) > 0;
+        // self.reserved = ((b >> 4) & 0x07) as u8;
+        // self.auth_data = (self.reserved & (1 << 1)) > 0;
+        // self.checking_disabled = (self.reserved & 1) > 0;
+        // self.recursion_ava = (b >> 7) > 0;
+        self.checking_disabled = (b & (1 << 4)) > 0;
+        self.auth_data = (b & (1 << 5)) > 0;
+        self.reserved = (b & (1 << 6)) > 0;
+        self.recursion_ava = (b & (1 << 7)) > 0;
 
         self.question_count = buffer.read_u16()?;
         self.answer_count = buffer.read_u16()?;
         self.authority_count = buffer.read_u16()?;
         self.additional_count = buffer.read_u16()?;
+
+        Ok(())
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_u16(self.id)?;
+        buffer.write_u8(
+            (self.recursion_desired as u8)
+                | ((self.truncated_message as u8) << 1)
+                | ((self.authorative_answer as u8) << 2)
+                | ((self.opcode as u8) << 3)
+                | ((self.query_response as u8) << 7),
+        )?;
+
+        buffer.write_u8(
+            (self.response_code as u8)
+                | ((self.checking_disabled as u8) << 4)
+                | ((self.auth_data as u8) << 5)
+                | ((self.reserved as u8) << 6)
+                | ((self.recursion_ava as u8) << 7),
+        )?;
+
+        buffer.write_u16(self.question_count)?;
+        buffer.write_u16(self.answer_count)?;
+        buffer.write_u16(self.authority_count)?;
+        buffer.write_u16(self.additional_count)?;
 
         Ok(())
     }
@@ -209,8 +289,8 @@ impl From<u16> for QueryType {
 impl Into<u16> for QueryType {
     fn into(self) -> u16 {
         match self {
-            Self::A => 1,
-            Self::UNKNOWN(num) => num,
+            Self::A => 1 as u16,
+            Self::UNKNOWN(num) => num as u16,
         }
     }
 }
@@ -232,6 +312,16 @@ impl DnsQuestion {
         buffer.read_qname(&mut self.name)?;
         self.question_type = QueryType::from(buffer.read_u16()?);
         let _ = buffer.read_u16()?; // class
+
+        Ok(())
+    }
+}
+
+impl DnsQuestion {
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_qname(&self.name)?;
+        buffer.write_u16(self.question_type.into())?;
+        buffer.write_u16(1)?;
 
         Ok(())
     }
@@ -287,6 +377,30 @@ impl DnsRecord {
     }
 }
 
+impl DnsRecord {
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        let start = buffer.pos();
+
+        match self {
+            DnsRecord::A { domain, ttl, ip } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::A.into())?;
+                buffer.write_u16(1)?; //class
+                buffer.write_u32(ttl.clone())?;
+                buffer.write_u16(4)?;
+
+                let octets = ip.octets();
+                buffer.write_u8(octets[0])?;
+                buffer.write_u8(octets[1])?;
+                buffer.write_u8(octets[2])?;
+                buffer.write_u8(octets[3])?;
+            }
+            DnsRecord::UNKNOWN { .. } => println!("Skipping record: {:?}", self),
+        }
+        Ok(buffer.pos() - start)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DnsPacket {
     pub header: DnsHeader,
@@ -331,12 +445,62 @@ impl DnsPacket {
         Ok(result)
     }
 }
-fn main() -> Result<()> {
-    let mut file = std::fs::File::open("response_packet.txt")?;
-    let mut buffer = BytePacketBuffer::new();
-    file.read(&mut buffer.buf)?;
+impl DnsPacket {
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.header.question_count = self.questions.len() as u16;
+        self.header.answer_count = self.answers.len() as u16;
+        self.header.authority_count = self.authorities.len() as u16;
+        self.header.additional_count = self.resources.len() as u16;
 
-    let packet = DnsPacket::from_buffer(&mut buffer)?;
+        self.header.write(buffer)?;
+
+        for q in self.questions.iter() {
+            q.write(buffer)?;
+        }
+        for a in self.answers.iter() {
+            a.write(buffer)?;
+        }
+        for a in self.authorities.iter() {
+            a.write(buffer)?;
+        }
+        for r in self.resources.iter() {
+            r.write(buffer)?;
+        }
+
+        Ok(())
+    }
+}
+fn main() -> Result<()> {
+    let qname = "google.com";
+    let qtype = QueryType::A;
+
+    let server = ("8.8.8.8", 53);
+    let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
+
+    let mut packet = DnsPacket::new();
+
+    packet.header.id = 6666;
+    packet.header.question_count = 1;
+    packet.header.recursion_desired = true;
+
+    packet
+        .questions
+        .push(DnsQuestion::new(qname.to_string(), qtype));
+
+    let mut request_buffer = BytePacketBuffer::new();
+
+    packet.write(&mut request_buffer)?;
+    let len = request_buffer.pos();
+
+    socket.send_to(&request_buffer.buf[..len], server)?;
+
+    let mut rec_buffer = BytePacketBuffer::new();
+    socket.recv_from(&mut rec_buffer.buf)?;
+
+    // let mut fileBuffer = BytePacketBuffer::new();
+    // let mut f = std::fs::File::open("query_packet.txt")?;
+    // f.read(&mut fileBuffer.buf)?;
+    let packet = DnsPacket::from_buffer(&mut rec_buffer)?;
 
     println!("{:#?}", packet.header);
 
