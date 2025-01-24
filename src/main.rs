@@ -1,5 +1,5 @@
 use std::{
-    io::{Error, ErrorKind, Result, Write},
+    io::{Error, ErrorKind, Result},
     net::{Ipv4Addr, Ipv6Addr, UdpSocket},
     usize,
 };
@@ -611,10 +611,7 @@ impl DnsPacket {
         Ok(())
     }
 }
-fn main() -> Result<()> {
-    let qname = "yahoo.com";
-    let qtype = QueryType::MX;
-
+fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     let server = ("8.8.8.8", 53);
     let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
 
@@ -638,23 +635,53 @@ fn main() -> Result<()> {
     let mut rec_buffer = BytePacketBuffer::new();
     socket.recv_from(&mut rec_buffer.buf)?;
 
-    let mut f = std::fs::File::create("output.txt")?;
-    f.write_all(&rec_buffer.buf)?;
-    let packet = DnsPacket::from_buffer(&mut rec_buffer)?;
+    DnsPacket::from_buffer(&mut rec_buffer)
+}
 
-    println!("{:#?}", packet.header);
+fn handle_query(socket: &UdpSocket) -> Result<()> {
+    let mut req_buffer = BytePacketBuffer::new();
+    let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
 
-    for q in packet.questions {
-        println!("{:#?}", q);
+    let mut request = DnsPacket::from_buffer(&mut req_buffer)?;
+    let mut packet = DnsPacket::new();
+    packet.header.id = request.header.id;
+    packet.header.recursion_desired = true;
+    packet.header.recursion_ava = true;
+    packet.header.query_response = true;
+
+    if let Some(query) = request.questions.pop() {
+        println!("Received query: {:?}", query);
+
+        if let Ok(result) = lookup(&query.name, query.question_type) {
+            packet.questions.push(query);
+            packet.header.response_code = result.header.response_code;
+
+            for rec in result.answers {
+                println!("Answer :{:?}", rec);
+            }
+            for rec in result.authorities {
+                println!("Answer :{:?}", rec);
+            }
+            for rec in result.resources {
+                println!("Answer :{:?}", rec);
+            }
+        } else {
+            packet.header.response_code = ResultCode::SERVFAIL;
+        }
+    } else {
+        packet.header.response_code = ResultCode::FORMERR;
     }
-    for a in packet.answers {
-        println!("{:#?}", a);
-    }
-    for a in packet.authorities {
-        println!("{:#?}", a);
-    }
-    for r in packet.resources {
-        println!("{:#?}", r);
-    }
+    let mut res_buffer = BytePacketBuffer::new();
+    packet.write(&mut res_buffer)?;
+
+    let len = res_buffer.pos();
+    let data = res_buffer.get_range(0, len)?;
+    socket.send_to(data, src)?;
     Ok(())
+}
+fn main() -> Result<()> {
+    let socket = UdpSocket::bind(("0.0.0.0", 2053))?;
+    loop {
+        handle_query(&socket)?;
+    }
 }
